@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import quote_plus
 
 import httpx
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -46,6 +46,7 @@ NEGATIVE_WORDS = (
 COMPANY_NAMES = {
     "SBER": "Сбербанк", "GAZP": "Газпром", "LKOH": "Лукойл", "YNDX": "Яндекс",
     "ROSN": "Роснефть", "TATN": "Татнефть", "MOEX": "Московская биржа",
+    "T": "Т-Банк / Т-Технологии",
     "GMKN": "Норникель", "NVTK": "Новатэк", "VTBR": "ВТБ",
 }
 
@@ -317,12 +318,23 @@ def export_csv() -> bytes:
 
 
 async def send_signal(chat_id: str, signal: Signal, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (f"MOEX {SIGNAL_HORIZON_MINUTES}M — BUY-кандидат\n\nТикер: {signal.ticker}\nЦена входа: {signal.entry:.4f} ₽\n"
+    company = COMPANY_NAMES.get(signal.ticker, signal.ticker)
+    text = (f"MOEX {SIGNAL_HORIZON_MINUTES}M — BUY-кандидат\n\n"
+            f"Компания: {company}\nТикер: {signal.ticker}\nЦена входа: {signal.entry:.4f} ₽\n"
             f"Цель: {signal.target:.4f} ₽\nСтоп: {signal.stop:.4f} ₽\nСрок: {SIGNAL_HORIZON_MINUTES} минут\n"
             f"Оценка условий: {signal.score:.1f}\nПричины: {signal.reason}\n"
             f"Индикаторы: {signal.indicators}\n{signal.news}\n\n"
             "Статус: бумажный сигнал, не приказ к покупке")
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    ticker = quote_plus(signal.ticker)
+    moex_url = f"https://www.moex.com/issue.aspx?board=TQBR&code={ticker}"
+    tbank_url = f"https://www.tbank.ru/invest/stocks/{ticker}/"
+    sber_url = f"https://www.sberbank.ru/ru/person/investments/stocks/{signal.ticker.lower()}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Открыть график в Т‑Инвестициях", url=tbank_url)],
+        [InlineKeyboardButton("Открыть график в СберИнвестициях", url=sber_url)],
+        [InlineKeyboardButton("Открыть карточку на MOEX", url=moex_url)],
+    ])
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
 
 
 async def scan_once(context: ContextTypes.DEFAULT_TYPE) -> None:
