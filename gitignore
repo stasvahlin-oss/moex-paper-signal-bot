@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+trades.db
+trades.db-shm
+trades.db-wal

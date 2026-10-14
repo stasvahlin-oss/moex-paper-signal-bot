@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: moex-paper-signal-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: DB_PATH
+        value: /opt/render/project/src/trades.db
+      - key: SCAN_SECONDS
+        value: "60"
+      - key: SIGNAL_MIN_SCORE
+        value: "4"
