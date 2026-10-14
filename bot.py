@@ -5,6 +5,8 @@ import logging
 import os
 import sqlite3
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -350,6 +352,24 @@ async def final_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("500 сделок накоплены. Используйте /export и пришлите CSV для анализа стратегии.\n\n" + stats_text())
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"MOEX paper bot is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server() -> None:
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on port %s", port)
+
+
 async def background_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await scan_once(context)
@@ -361,6 +381,7 @@ def main() -> None:
     if not TOKEN:
         raise RuntimeError("Не задана переменная TELEGRAM_BOT_TOKEN")
     db().close()
+    start_health_server()
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("scan", scan_command))
