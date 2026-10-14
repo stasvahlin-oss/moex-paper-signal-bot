@@ -2,6 +2,7 @@ import asyncio
 import csv
 import io
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -27,6 +28,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "trades.db")
 SCAN_SECONDS = int(os.environ.get("SCAN_SECONDS", "60"))
 SIGNAL_MIN_SCORE = float(os.environ.get("SIGNAL_MIN_SCORE", "4"))
+SIGNAL_HORIZON_MINUTES = max(5, min(240, int(os.environ.get("SIGNAL_HORIZON_MINUTES", "5"))))
 
 # Ликвидные инструменты TQBR по умолчанию; список можно изменить через MOEX_TICKERS.
 TICKERS = [x.strip().upper() for x in os.environ.get(
@@ -121,6 +123,24 @@ def rsi(values: list[float], period: int = 14) -> float:
     return 100 - 100 / (1 + avg_gain / avg_loss)
 
 
+def resample_candles(candles: list[Candle], minutes: int) -> list[Candle]:
+    """Собирает минутные свечи MOEX в горизонт от 5 минут до 4 часов."""
+    if minutes <= 1:
+        return candles
+    buckets: dict[int, list[Candle]] = {}
+    size = minutes * 60
+    for candle in candles:
+        bucket = (candle.ts // size) * size
+        buckets.setdefault(bucket, []).append(candle)
+    result = []
+    for bucket, items in sorted(buckets.items()):
+        items.sort(key=lambda item: item.ts)
+        result.append(Candle(bucket, items[0].open, max(item.high for item in items),
+                             min(item.low for item in items), items[-1].close,
+                             sum(item.volume for item in items)))
+    return result
+
+
 def parse_candles(payload: dict[str, Any]) -> list[Candle]:
     block = payload.get("candles", {})
     columns = block.get("columns", [])
@@ -148,10 +168,11 @@ async def fetch_candles(client: httpx.AsyncClient, ticker: str) -> list[Candle]:
     start = end - timedelta(days=10)
     response = await client.get(
         MOEX_CANDLES.format(ticker=ticker),
-        params={"interval": 5, "from": start.isoformat(), "till": end.isoformat(), "iss.meta": "off"},
+        params={"interval": 1, "from": start.isoformat(), "till": end.isoformat(), "iss.meta": "off"},
     )
     response.raise_for_status()
-    return parse_candles(response.json())[-120:]
+    candles = parse_candles(response.json())
+    return resample_candles(candles, SIGNAL_HORIZON_MINUTES)[-240:]
 
 
 async def fetch_news(client: httpx.AsyncClient, ticker: str) -> tuple[str, bool]:
@@ -207,8 +228,9 @@ async def make_signal(client: httpx.AsyncClient, ticker: str) -> Signal | None:
         return None
     # Модельная бумажная цель/стоп; это не обещание результата.
     entry = last.close
-    target = round(entry * 1.003, 4)
-    stop = round(entry * 0.998, 4)
+    horizon_scale = math.sqrt(SIGNAL_HORIZON_MINUTES / 5)
+    target = round(entry * (1 + 0.003 * horizon_scale), 4)
+    stop = round(entry * (1 - 0.002 * horizon_scale), 4)
     indicators = f"EMA9={ema9:.4f}; EMA21={ema21:.4f}; RSI={rsi14:.1f}; VWAP={vwap:.4f}; volume_ratio={volume_ratio:.2f}"
     return Signal(ticker, entry, target, stop, score, "; ".join(reasons), indicators, news)
 
@@ -220,9 +242,10 @@ def active_trade(conn: sqlite3.Connection, ticker: str) -> sqlite3.Row | None:
 def create_trade(signal: Signal) -> None:
     conn = db()
     conn.execute("""INSERT INTO trades
-        (created_at,ticker,side,entry,target,stop,score,status,reason,indicators,news)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (now_iso(), signal.ticker, "BUY", signal.entry,
-        signal.target, signal.stop, signal.score, "OPEN", signal.reason, signal.indicators, signal.news))
+        (created_at,ticker,side,entry,target,stop,score,status,reason,indicators,news,timeframe)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (now_iso(), signal.ticker, "BUY", signal.entry,
+        signal.target, signal.stop, signal.score, "OPEN", signal.reason, signal.indicators, signal.news,
+        f"{SIGNAL_HORIZON_MINUTES}m"))
     conn.commit(); conn.close()
 
 
@@ -250,7 +273,7 @@ async def update_open_trades(client: httpx.AsyncClient) -> None:
                 close_trade(row, price, "TARGET")
             elif price <= row["stop"]:
                 close_trade(row, price, "STOP")
-            elif age >= 300:
+            elif age >= SIGNAL_HORIZON_MINUTES * 60:
                 close_trade(row, price, "EXPIRED")
         except (httpx.HTTPError, ValueError, IndexError) as error:
             log.warning("close %s: %s", row["ticker"], error)
@@ -277,7 +300,7 @@ def stats() -> dict[str, Any]:
 
 def stats_text() -> str:
     s = stats()
-    return (f"Бумажная статистика MOEX 5m\n\nЗакрыто: {s['total']}/500\n"
+    return (f"Бумажная статистика MOEX {SIGNAL_HORIZON_MINUTES}m\n\nЗакрыто: {s['total']}/500\n"
             f"Прибыльных: {s['wins']} | Убыточных/истёкших: {s['losses']}\n"
             f"Win rate: {s['win_rate']:.1f}%\nСуммарный PnL: {s['pnl']:.2f} ₽\n"
             f"Средняя прибыль: {s['avg_win']:.2f} ₽\nСредний убыток: {s['avg_loss']:.2f} ₽\n"
@@ -294,8 +317,8 @@ def export_csv() -> bytes:
 
 
 async def send_signal(chat_id: str, signal: Signal, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (f"MOEX 5M — BUY-кандидат\n\nТикер: {signal.ticker}\nЦена входа: {signal.entry:.4f} ₽\n"
-            f"Цель: {signal.target:.4f} ₽\nСтоп: {signal.stop:.4f} ₽\nСрок: 5 минут\n"
+    text = (f"MOEX {SIGNAL_HORIZON_MINUTES}M — BUY-кандидат\n\nТикер: {signal.ticker}\nЦена входа: {signal.entry:.4f} ₽\n"
+            f"Цель: {signal.target:.4f} ₽\nСтоп: {signal.stop:.4f} ₽\nСрок: {SIGNAL_HORIZON_MINUTES} минут\n"
             f"Оценка условий: {signal.score:.1f}\nПричины: {signal.reason}\n"
             f"Индикаторы: {signal.indicators}\n{signal.news}\n\n"
             "Статус: бумажный сигнал, не приказ к покупке")
@@ -392,6 +415,12 @@ def main() -> None:
         application.job_queue.run_repeating(background_scan, interval=SCAN_SECONDS, first=10)
     else:
         log.warning("JobQueue unavailable; install python-telegram-bot[job-queue]")
+    # Python 3.14 no longer creates a default event loop automatically.
+    # python-telegram-bot 21.x expects one for run_polling().
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
