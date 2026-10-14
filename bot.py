@@ -30,11 +30,13 @@ SCAN_SECONDS = int(os.environ.get("SCAN_SECONDS", "60"))
 SIGNAL_MIN_SCORE = float(os.environ.get("SIGNAL_MIN_SCORE", "4"))
 SIGNAL_HORIZON_MINUTES = max(5, min(240, int(os.environ.get("SIGNAL_HORIZON_MINUTES", "5"))))
 
-# Ликвидные инструменты TQBR по умолчанию; список можно изменить через MOEX_TICKERS.
-TICKERS = [x.strip().upper() for x in os.environ.get(
-    "MOEX_TICKERS", "SBER,GAZP,LKOH,YNDX,ROSN,TATN,MOEX,GMKN,NVTK,VTBR"
-).split(",") if x.strip()]
+# Значение ALL означает: загрузить все активные акции с доски TQBR.
+TICKER_SETTING = os.environ.get("MOEX_TICKERS", "ALL").strip().upper()
+TICKERS = [] if TICKER_SETTING in ("", "ALL", "*", "ВСЕ") else [
+    x.strip() for x in TICKER_SETTING.split(",") if x.strip()
+]
 
+MOEX_SECURITIES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
 MOEX_CANDLES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}/candles.json"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}+акции&hl=ru&gl=RU&ceid=RU:ru"
 
@@ -164,6 +166,35 @@ def parse_candles(payload: dict[str, Any]) -> list[Candle]:
     return result
 
 
+async def fetch_universe(client: httpx.AsyncClient) -> list[str]:
+    """Получает актуальный список активных акций на доске TQBR."""
+    response = await client.get(
+        MOEX_SECURITIES,
+        params={
+            "iss.meta": "off",
+            "iss.only": "securities",
+            "securities.columns": "SECID,SHORTNAME,STATUS",
+        },
+    )
+    response.raise_for_status()
+    block = response.json().get("securities", {})
+    columns = block.get("columns", [])
+    rows = block.get("data", [])
+    positions = {name: columns.index(name) for name in columns}
+    result = []
+    for row in rows:
+        try:
+            ticker = str(row[positions["SECID"]]).upper()
+            name = str(row[positions["SHORTNAME"]])
+            status = str(row[positions["STATUS"]]).upper()
+            if ticker and status not in {"D", "DELISTED"}:
+                COMPANY_NAMES.setdefault(ticker, name)
+                result.append(ticker)
+        except (KeyError, IndexError, TypeError):
+            continue
+    return sorted(set(result))
+
+
 async def fetch_candles(client: httpx.AsyncClient, ticker: str) -> list[Candle]:
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=10)
@@ -222,10 +253,12 @@ async def make_signal(client: httpx.AsyncClient, ticker: str) -> Signal | None:
         score += 1.5; reasons.append("пробой локального максимума")
     if last.close > last.open:
         score += 0.5; reasons.append("положительная свеча")
+    if score < SIGNAL_MIN_SCORE:
+        return None
+    # Новости загружаем только для технических кандидатов, иначе сканер всей биржи
+    # создавал бы лишние сотни RSS-запросов.
     news, negative_news = await fetch_news(client, ticker)
     if negative_news:
-        return None
-    if score < SIGNAL_MIN_SCORE:
         return None
     # Модельная бумажная цель/стоп; это не обещание результата.
     entry = last.close
@@ -342,19 +375,41 @@ async def scan_once(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("ADMIN_CHAT_ID не задан: сканирование работает, но уведомлять некого")
     async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "MOEX-Paper-Signal-Bot/1.0"}) as client:
         await update_open_trades(client)
-        for ticker in TICKERS:
+        if TICKERS:
+            tickers = TICKERS
+        else:
+            cache = context.application.bot_data.get("moex_universe")
+            cache_time = context.application.bot_data.get("moex_universe_time", 0)
+            if not cache or time.time() - cache_time > 3600:
+                try:
+                    cache = await fetch_universe(client)
+                    context.application.bot_data["moex_universe"] = cache
+                    context.application.bot_data["moex_universe_time"] = time.time()
+                    log.info("MOEX universe loaded: %s active TQBR shares", len(cache))
+                except (httpx.HTTPError, ValueError, KeyError) as error:
+                    log.warning("MOEX universe unavailable: %s", error)
+                    cache = []
+            tickers = cache or []
+
+        semaphore = asyncio.Semaphore(8)
+        async def scan_ticker(ticker: str):
             try:
                 conn = db(); already_open = active_trade(conn, ticker); conn.close()
                 if already_open:
-                    continue
-                signal = await make_signal(client, ticker)
-                if signal:
-                    create_trade(signal)
-                    if ADMIN_CHAT_ID:
-                        await send_signal(ADMIN_CHAT_ID, signal, context)
-                    log.info("paper signal %s %.4f", ticker, signal.entry)
+                    return None
+                async with semaphore:
+                    return await make_signal(client, ticker)
             except (httpx.HTTPError, ValueError, KeyError, IndexError) as error:
                 log.warning("scan %s: %s", ticker, error)
+                return None
+
+        signals = await asyncio.gather(*(scan_ticker(ticker) for ticker in tickers))
+        for signal in signals:
+            if signal:
+                create_trade(signal)
+                if ADMIN_CHAT_ID:
+                    await send_signal(ADMIN_CHAT_ID, signal, context)
+                log.info("paper signal %s %.4f", signal.ticker, signal.entry)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
