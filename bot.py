@@ -16,9 +16,9 @@ from typing import Any
 from urllib.parse import quote_plus
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("moex-signal-bot")
@@ -566,14 +566,60 @@ async def scan_once(context: ContextTypes.DEFAULT_TYPE) -> None:
                 log.info("paper signal %s %.4f", signal.ticker, signal.entry)
 
 
+MODE_OFF = "off"
+MODE_MOEX = "moex"
+MODE_CRYPTO = "crypto"
+BTN_OFF = "Выключить сигналы"
+BTN_MOEX = "Анализ ценных бумаг"
+BTN_CRYPTO = "Анализ крипты"
+
+
+def mode_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_OFF)], [KeyboardButton(BTN_MOEX)], [KeyboardButton(BTN_CRYPTO)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def active_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.application.bot_data.get("active_mode", MODE_OFF)
+
+
+def set_active_mode(context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    # Один общий переключатель: одновременно работает только один режим.
+    context.application.bot_data["active_mode"] = mode
+
+
+async def mode_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update): return
+    text = update.message.text
+    if text == BTN_OFF:
+        set_active_mode(context, MODE_OFF)
+        await update.message.reply_text("Сигналы выключены. Оба автоматических режима остановлены.", reply_markup=mode_keyboard())
+    elif text == BTN_MOEX:
+        set_active_mode(context, MODE_MOEX)
+        await update.message.reply_text("Включён анализ ценных бумаг MOEX. Крипторежим выключен.", reply_markup=mode_keyboard())
+        await scan_once(context)
+    elif text == BTN_CRYPTO:
+        set_active_mode(context, MODE_CRYPTO)
+        await update.message.reply_text("Включён анализ крипты. Анализ ценных бумаг выключен.", reply_markup=mode_keyboard())
+        await crypto_scan_once(context)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update): return
-    await update.message.reply_text("MOEX + Crypto Paper Signal Bot активен. Только виртуальные сделки.\nКоманды: /scan /crypto_scan /report /crypto_report /export /final_report")
+    await update.message.reply_text(
+        "MOEX + Crypto Paper Signal Bot активен. Только виртуальные сделки.\n"
+        "Выберите один режим кнопкой ниже. Одновременно работает только один режим.",
+        reply_markup=mode_keyboard(),
+    )
 
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update): return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    set_active_mode(context, MODE_MOEX)
     await scan_once(context)
     await update.message.reply_text("Сканирование завершено.\n\n" + stats_text())
 
@@ -581,6 +627,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def crypto_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update): return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    set_active_mode(context, MODE_CRYPTO)
     try:
         await crypto_scan_once(context)
         await update.message.reply_text("Проверка топ-100 криптовалют завершена.\n\n" + crypto_stats_text())
@@ -630,6 +677,8 @@ def start_health_server() -> None:
 
 
 async def background_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if active_mode(context) != MODE_MOEX:
+        return
     try:
         await scan_once(context)
     except Exception:
@@ -637,6 +686,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def background_crypto_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if active_mode(context) != MODE_CRYPTO:
+        return
     try:
         await crypto_scan_once(context)
     except Exception:
@@ -650,6 +701,7 @@ def main() -> None:
     start_health_server()
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mode_message))
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("crypto_scan", crypto_scan_command))
     application.add_handler(CommandHandler("crypto_report", crypto_report))
