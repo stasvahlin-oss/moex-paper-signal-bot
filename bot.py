@@ -28,7 +28,11 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "trades.db")
 SCAN_SECONDS = int(os.environ.get("SCAN_SECONDS", "60"))
 SIGNAL_MIN_SCORE = float(os.environ.get("SIGNAL_MIN_SCORE", "4"))
-SIGNAL_HORIZON_MINUTES = max(5, min(240, int(os.environ.get("SIGNAL_HORIZON_MINUTES", "5"))))
+SIGNAL_HORIZON_MINUTES = max(5, min(240, int(os.environ.get("SIGNAL_HORIZON_MINUTES", "240"))))
+TARGET_PROFIT_PCT = max(0.001, min(0.50, float(os.environ.get("TARGET_PROFIT_PCT", "0.05"))))
+CRYPTO_HORIZON_MINUTES = 10
+CRYPTO_TARGET_PROFIT_PCT = max(0.001, min(0.50, float(os.environ.get("CRYPTO_TARGET_PROFIT_PCT", "0.05"))))
+CRYPTO_LIMIT = 100
 
 # Значение ALL означает: загрузить все активные акции с доски TQBR.
 TICKER_SETTING = os.environ.get("MOEX_TICKERS", "ALL").strip().upper()
@@ -38,6 +42,8 @@ TICKERS = [] if TICKER_SETTING in ("", "ALL", "*", "ВСЕ") else [
 
 MOEX_SECURITIES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
 MOEX_CANDLES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}/candles.json"
+COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}+акции&hl=ru&gl=RU&ceid=RU:ru"
 
 NEGATIVE_WORDS = (
@@ -69,6 +75,14 @@ def db() -> sqlite3.Connection:
         score REAL NOT NULL, status TEXT NOT NULL,
         pnl REAL, pnl_pct REAL, reason TEXT, indicators TEXT,
         news TEXT, timeframe TEXT NOT NULL DEFAULT '5m'
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS crypto_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL, closed_at TEXT, ticker TEXT NOT NULL,
+        name TEXT, entry REAL NOT NULL, exit REAL, target REAL NOT NULL,
+        stop REAL NOT NULL, score REAL NOT NULL, status TEXT NOT NULL,
+        pnl REAL, pnl_pct REAL, reason TEXT, indicators TEXT,
+        timeframe TEXT NOT NULL DEFAULT '10m'
     )""")
     conn.commit()
     return conn
@@ -262,11 +276,85 @@ async def make_signal(client: httpx.AsyncClient, ticker: str) -> Signal | None:
         return None
     # Модельная бумажная цель/стоп; это не обещание результата.
     entry = last.close
-    horizon_scale = math.sqrt(SIGNAL_HORIZON_MINUTES / 5)
-    target = round(entry * (1 + 0.003 * horizon_scale), 4)
-    stop = round(entry * (1 - 0.002 * horizon_scale), 4)
+    target = round(entry * (1 + TARGET_PROFIT_PCT), 4)
+    stop = round(entry * 0.998, 4)
     indicators = f"EMA9={ema9:.4f}; EMA21={ema21:.4f}; RSI={rsi14:.1f}; VWAP={vwap:.4f}; volume_ratio={volume_ratio:.2f}"
     return Signal(ticker, entry, target, stop, score, "; ".join(reasons), indicators, news)
+
+
+async def fetch_crypto_universe(client: httpx.AsyncClient) -> list[dict[str, str]]:
+    response = await client.get(COINGECKO_MARKETS, params={
+        "vs_currency": "usd", "order": "market_cap_desc", "per_page": CRYPTO_LIMIT,
+        "page": 1, "sparkline": "false", "locale": "en",
+    })
+    response.raise_for_status()
+    result = []
+    for item in response.json():
+        symbol = str(item.get("symbol", "")).upper()
+        coin_id = str(item.get("id", ""))
+        name = str(item.get("name", symbol))
+        if symbol and coin_id and symbol not in {"USDT", "USDC", "DAI", "BUSD", "USDE"}:
+            result.append({"id": coin_id, "symbol": symbol, "name": name})
+    return result[:CRYPTO_LIMIT]
+
+
+async def fetch_crypto_candles(client: httpx.AsyncClient, symbol: str) -> list[Candle]:
+    response = await client.get(BINANCE_KLINES, params={"symbol": f"{symbol}USDT", "interval": "1m", "limit": 180})
+    if response.status_code in (400, 404):
+        return []
+    response.raise_for_status()
+    result = []
+    for row in response.json():
+        try:
+            result.append(Candle(int(row[0] / 1000), float(row[1]), float(row[2]),
+                                 float(row[3]), float(row[4]), float(row[5])))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return result
+
+
+async def make_crypto_signal(client: httpx.AsyncClient, coin: dict[str, str]) -> Signal | None:
+    candles = await fetch_crypto_candles(client, coin["symbol"])
+    if len(candles) < 35:
+        return None
+    closed = candles[:-1] or candles
+    last = closed[-1]
+    closes = [c.close for c in closed]
+    ema9, ema21, rsi14 = ema(closes, 9), ema(closes, 21), rsi(closes, 14)
+    recent = closed[-21:-1]
+    recent_high = max(c.high for c in recent)
+    avg_volume = mean(c.volume for c in closed[-21:-1]) or 1
+    volume_ratio = last.volume / avg_volume
+    vwap_window = closed[-20:]
+    vwap_den = sum(c.volume for c in vwap_window) or 1
+    vwap = sum(((c.high + c.low + c.close) / 3) * c.volume for c in vwap_window) / vwap_den
+    score = 0.0
+    reasons = []
+    if last.close > ema9 > ema21: score += 1.5; reasons.append("EMA9 выше EMA21")
+    if last.close > vwap: score += 1.0; reasons.append("цена выше VWAP")
+    if 52 <= rsi14 <= 72: score += 1.0; reasons.append(f"RSI {rsi14:.1f} в рабочей зоне")
+    if volume_ratio >= 1.2: score += 1.5; reasons.append(f"объём {volume_ratio:.1f}x к среднему")
+    if last.close > recent_high: score += 1.5; reasons.append("пробой локального максимума")
+    if last.close > last.open: score += 0.5; reasons.append("положительная свеча")
+    if score < SIGNAL_MIN_SCORE: return None
+    entry = last.close
+    target = entry * (1 + CRYPTO_TARGET_PROFIT_PCT)
+    stop = entry * 0.998
+    indicators = f"EMA9={ema9:.6g}; EMA21={ema21:.6g}; RSI={rsi14:.1f}; VWAP={vwap:.6g}; volume_ratio={volume_ratio:.2f}"
+    return Signal(f"{coin['symbol']}/USDT", entry, target, stop, score, "; ".join(reasons), indicators, coin["name"])
+
+
+def active_crypto_trade(conn: sqlite3.Connection, ticker: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM crypto_trades WHERE ticker=? AND status='OPEN' ORDER BY id DESC LIMIT 1", (ticker,)).fetchone()
+
+
+def create_crypto_trade(signal: Signal) -> None:
+    conn = db()
+    conn.execute("""INSERT INTO crypto_trades
+        (created_at,ticker,name,entry,target,stop,score,status,reason,indicators,timeframe)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (now_iso(), signal.ticker, signal.news, signal.entry,
+        signal.target, signal.stop, signal.score, "OPEN", signal.reason, signal.indicators, "10m"))
+    conn.commit(); conn.close()
 
 
 def active_trade(conn: sqlite3.Connection, ticker: str) -> sqlite3.Row | None:
@@ -350,11 +438,77 @@ def export_csv() -> bytes:
     return output.getvalue().encode("utf-8-sig")
 
 
+async def update_open_crypto_trades(client: httpx.AsyncClient) -> None:
+    conn = db(); rows = conn.execute("SELECT * FROM crypto_trades WHERE status='OPEN'").fetchall(); conn.close()
+    for row in rows:
+        try:
+            candles = await fetch_crypto_candles(client, row["ticker"].split("/")[0])
+            if not candles: continue
+            price = candles[-1].close
+            age = time.time() - datetime.fromisoformat(row["created_at"]).timestamp()
+            status = "TARGET" if price >= row["target"] else "STOP" if price <= row["stop"] else "EXPIRED" if age >= 600 else None
+            if status:
+                pnl = price - row["entry"]
+                conn = db(); conn.execute("UPDATE crypto_trades SET closed_at=?,exit=?,pnl=?,pnl_pct=?,status=? WHERE id=?",
+                    (now_iso(), price, pnl, pnl / row["entry"] * 100 if row["entry"] else 0, status, row["id"])); conn.commit(); conn.close()
+        except (httpx.HTTPError, ValueError, IndexError):
+            continue
+
+
+def crypto_stats_text() -> str:
+    conn = db(); total = conn.execute("SELECT COUNT(*) FROM crypto_trades WHERE status!='OPEN'").fetchone()[0]
+    wins = conn.execute("SELECT COUNT(*) FROM crypto_trades WHERE status='TARGET'").fetchone()[0]
+    pnl = conn.execute("SELECT COALESCE(SUM(pnl_pct),0) FROM crypto_trades WHERE status!='OPEN'").fetchone()[0]
+    opened = conn.execute("SELECT COUNT(*) FROM crypto_trades WHERE status='OPEN'").fetchone()[0]; conn.close()
+    return (f"Бумажная статистика крипты 10m\n\nЗакрыто: {total}/500\n"
+            f"Цель +5% достигнута: {wins}\nWin rate: {wins / total * 100 if total else 0:.1f}%\n"
+            f"Сумма изменений: {pnl:.2f}%\nОткрытых сигналов: {opened}\n\nНе финансовая гарантия; сделки виртуальные.")
+
+
+async def send_crypto_signal(chat_id: str, signal: Signal, context: ContextTypes.DEFAULT_TYPE) -> None:
+    symbol = signal.ticker.split("/")[0]
+    text = (f"КРИПТО 10M — BUY-кандидат\n\nМонета: {signal.news}\nПара: {signal.ticker}\n"
+            f"Цена входа: {signal.entry:.8g} USDT\nЦель: {signal.target:.8g} USDT (+{CRYPTO_TARGET_PROFIT_PCT * 100:.1f}%)\n"
+            f"Стоп: {signal.stop:.8g} USDT\nСрок: 10 минут\nОценка условий: {signal.score:.1f}\n"
+            f"Причины: {signal.reason}\nИндикаторы: {signal.indicators}\n\n"
+            "Статус: бумажный сигнал, не приказ к покупке")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Открыть график Binance", url=f"https://www.binance.com/en/trade/{symbol}_USDT")],
+        [InlineKeyboardButton("Открыть график TradingView", url=f"https://www.tradingview.com/symbols/{symbol}USDT/")],
+    ])
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+async def crypto_scan_once(context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "MOEX-Crypto-Paper-Bot/1.0"}) as client:
+        await update_open_crypto_trades(client)
+        cache = context.application.bot_data.get("crypto_universe")
+        cache_time = context.application.bot_data.get("crypto_universe_time", 0)
+        if not cache or time.time() - cache_time > 3600:
+            cache = await fetch_crypto_universe(client)
+            context.application.bot_data["crypto_universe"] = cache
+            context.application.bot_data["crypto_universe_time"] = time.time()
+            log.info("Crypto universe loaded: %s top coins", len(cache))
+        semaphore = asyncio.Semaphore(8)
+        async def scan_coin(coin):
+            try:
+                conn = db(); active = active_crypto_trade(conn, f"{coin['symbol']}/USDT"); conn.close()
+                if active: return None
+                async with semaphore: return await make_crypto_signal(client, coin)
+            except (httpx.HTTPError, ValueError, KeyError, IndexError): return None
+        signals = await asyncio.gather(*(scan_coin(coin) for coin in cache))
+        for signal in signals:
+            if signal:
+                create_crypto_trade(signal)
+                if ADMIN_CHAT_ID: await send_crypto_signal(ADMIN_CHAT_ID, signal, context)
+
+
 async def send_signal(chat_id: str, signal: Signal, context: ContextTypes.DEFAULT_TYPE) -> None:
     company = COMPANY_NAMES.get(signal.ticker, signal.ticker)
     text = (f"MOEX {SIGNAL_HORIZON_MINUTES}M — BUY-кандидат\n\n"
             f"Компания: {company}\nТикер: {signal.ticker}\nЦена входа: {signal.entry:.4f} ₽\n"
-            f"Цель: {signal.target:.4f} ₽\nСтоп: {signal.stop:.4f} ₽\nСрок: {SIGNAL_HORIZON_MINUTES} минут\n"
+            f"Цель: {signal.target:.4f} ₽ (+{TARGET_PROFIT_PCT * 100:.1f}%)\n"
+            f"Стоп: {signal.stop:.4f} ₽\nСрок: {SIGNAL_HORIZON_MINUTES} минут\n"
             f"Оценка условий: {signal.score:.1f}\nПричины: {signal.reason}\n"
             f"Индикаторы: {signal.indicators}\n{signal.news}\n\n"
             "Статус: бумажный сигнал, не приказ к покупке")
@@ -414,7 +568,7 @@ async def scan_once(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update): return
-    await update.message.reply_text("MOEX Paper Signal Bot активен. Используются только виртуальные сделки.\nКоманды: /scan /report /export /final_report")
+    await update.message.reply_text("MOEX + Crypto Paper Signal Bot активен. Только виртуальные сделки.\nКоманды: /scan /crypto_scan /report /crypto_report /export /final_report")
 
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -422,6 +576,21 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     await scan_once(context)
     await update.message.reply_text("Сканирование завершено.\n\n" + stats_text())
+
+
+async def crypto_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update): return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        await crypto_scan_once(context)
+        await update.message.reply_text("Проверка топ-100 криптовалют завершена.\n\n" + crypto_stats_text())
+    except (httpx.HTTPError, ValueError, KeyError) as error:
+        log.exception("crypto scan failed")
+        await update.message.reply_text(f"Криптосканирование временно недоступно: {error}")
+
+
+async def crypto_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if authorized(update): await update.message.reply_text(crypto_stats_text())
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -464,7 +633,14 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await scan_once(context)
     except Exception:
-        log.exception("background scan failed")
+        log.exception("background MOEX scan failed")
+
+
+async def background_crypto_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await crypto_scan_once(context)
+    except Exception:
+        log.exception("background crypto scan failed")
 
 
 def main() -> None:
@@ -475,11 +651,14 @@ def main() -> None:
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("crypto_scan", crypto_scan_command))
+    application.add_handler(CommandHandler("crypto_report", crypto_report))
     application.add_handler(CommandHandler("report", report))
     application.add_handler(CommandHandler("export", export_command))
     application.add_handler(CommandHandler("final_report", final_report))
     if application.job_queue:
         application.job_queue.run_repeating(background_scan, interval=SCAN_SECONDS, first=10)
+        application.job_queue.run_repeating(background_crypto_scan, interval=600, first=30)
     else:
         log.warning("JobQueue unavailable; install python-telegram-bot[job-queue]")
     # Python 3.14 no longer creates a default event loop automatically.
