@@ -33,6 +33,19 @@ TARGET_PROFIT_PCT = max(0.001, min(0.50, float(os.environ.get("TARGET_PROFIT_PCT
 CRYPTO_HORIZON_MINUTES = 10
 CRYPTO_TARGET_PROFIT_PCT = max(0.001, min(0.50, float(os.environ.get("CRYPTO_TARGET_PROFIT_PCT", "0.05"))))
 CRYPTO_LIMIT = 100
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
+FALLBACK_CRYPTO = [
+    ("bitcoin", "BTC", "Bitcoin"), ("ethereum", "ETH", "Ethereum"),
+    ("tether", "USDT", "Tether"), ("binancecoin", "BNB", "BNB"),
+    ("solana", "SOL", "Solana"), ("usd-coin", "USDC", "USDC"),
+    ("ripple", "XRP", "XRP"), ("dogecoin", "DOGE", "Dogecoin"),
+    ("cardano", "ADA", "Cardano"), ("avalanche-2", "AVAX", "Avalanche"),
+    ("chainlink", "LINK", "Chainlink"), ("polkadot", "DOT", "Polkadot"),
+    ("tron", "TRX", "TRON"), ("uniswap", "UNI", "Uniswap"),
+    ("litecoin", "LTC", "Litecoin"), ("near", "NEAR", "NEAR Protocol"),
+    ("stellar", "XLM", "Stellar"), ("cosmos", "ATOM", "Cosmos"),
+    ("monero", "XMR", "Monero"), ("aptos", "APT", "Aptos"),
+]
 
 # Значение ALL означает: загрузить все активные акции с доски TQBR.
 TICKER_SETTING = os.environ.get("MOEX_TICKERS", "ALL").strip().upper()
@@ -283,11 +296,22 @@ async def make_signal(client: httpx.AsyncClient, ticker: str) -> Signal | None:
 
 
 async def fetch_crypto_universe(client: httpx.AsyncClient) -> list[dict[str, str]]:
-    response = await client.get(COINGECKO_MARKETS, params={
-        "vs_currency": "usd", "order": "market_cap_desc", "per_page": CRYPTO_LIMIT,
-        "page": 1, "sparkline": "false", "locale": "en",
-    })
-    response.raise_for_status()
+    headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+    for attempt in range(2):
+        response = await client.get(COINGECKO_MARKETS, headers=headers, params={
+            "vs_currency": "usd", "order": "market_cap_desc", "per_page": CRYPTO_LIMIT,
+            "page": 1, "sparkline": "false", "locale": "en",
+        })
+        if response.status_code != 429:
+            response.raise_for_status()
+            break
+        retry_after = response.headers.get("Retry-After", "10")
+        try:
+            await asyncio.sleep(min(30, max(2, int(retry_after))))
+        except ValueError:
+            await asyncio.sleep(10)
+    else:
+        raise httpx.HTTPStatusError("CoinGecko rate limit (429)", request=response.request, response=response)
     result = []
     for item in response.json():
         symbol = str(item.get("symbol", "")).upper()
@@ -479,16 +503,24 @@ async def send_crypto_signal(chat_id: str, signal: Signal, context: ContextTypes
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
 
 
+def fallback_crypto_universe() -> list[dict[str, str]]:
+    return [{"id": coin_id, "symbol": symbol, "name": name} for coin_id, symbol, name in FALLBACK_CRYPTO]
+
+
 async def crypto_scan_once(context: ContextTypes.DEFAULT_TYPE) -> None:
     async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "MOEX-Crypto-Paper-Bot/1.0"}) as client:
         await update_open_crypto_trades(client)
         cache = context.application.bot_data.get("crypto_universe")
         cache_time = context.application.bot_data.get("crypto_universe_time", 0)
         if not cache or time.time() - cache_time > 3600:
-            cache = await fetch_crypto_universe(client)
+            try:
+                cache = await fetch_crypto_universe(client)
+                log.info("Crypto universe loaded from CoinGecko: %s top coins", len(cache))
+            except httpx.HTTPStatusError as error:
+                cache = fallback_crypto_universe()
+                log.warning("CoinGecko unavailable (%s); using fallback crypto list: %s coins", error.response.status_code, len(cache))
             context.application.bot_data["crypto_universe"] = cache
             context.application.bot_data["crypto_universe_time"] = time.time()
-            log.info("Crypto universe loaded: %s top coins", len(cache))
         semaphore = asyncio.Semaphore(8)
         async def scan_coin(coin):
             try:
